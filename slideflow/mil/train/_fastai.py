@@ -317,14 +317,12 @@ def _build_fastai_learner(
             #Make sure durations are float valued in the case of survival
             if problem_type == "survival":
                 targets[:, 0] = targets[:, 0].astype(float)
-                
-            elif problem_type == "survival_discrete":
+                encoder = None
+            else: # problem_type == "survival_discrete"
                 #Convert time bins to int
                 targets[:, 0] = targets[:, 0].astype(int)
                 # Use time bins to define the output dimension.
                 encoder = OneHotEncoder(sparse_output=False).fit(targets[:, 0].reshape(-1, 1))
-            else:
-                encoder = None
         else:  # regression
             targets = np.array(targets, dtype=np.float32)
             encoder = None
@@ -337,7 +335,7 @@ def _build_fastai_learner(
 
         if problem_type == 'survival_discrete':
             time_bins = targets[:, 0].astype(int)
-            loggin.debug(f"Time bins shape: {time_bins.shape}")
+            logging.debug(f"Time bins shape: {time_bins.shape}")
             time_bin_centers = np.unique(time_bins)
             logging.debug(f"Unique time bins: {time_bin_centers}")
             encoder = OneHotEncoder(sparse_output=False).fit(time_bins.reshape(-1, 1))
@@ -367,7 +365,8 @@ def _build_fastai_learner(
     if slide_level:
         logging.info("Building slide-level datasets....")
         #Log encoder and targets
-        logging.debug(f"Encoder categories: {encoder.categories_}")
+        if encoder is not None:
+            logging.debug(f"Encoder categories: {encoder.categories_}")
         logging.debug(f"Targets shape: {targets.shape}")
         train_dataset = data_utils.build_slide_dataset(
             [bags[i] for i in train_idx],
@@ -384,7 +383,9 @@ def _build_fastai_learner(
             bag_size=1
         )
 
-        ctx = mp.get_context("spawn")
+        use_multiprocessing = dl_kwargs.get("num_workers", num_workers) > 0
+        ctx = mp.get_context("spawn") if use_multiprocessing else None
+
         #Log one sample from the dataset
         logging.debug(f"Sample from slide-level train dataset: {train_dataset[0]}")
         # Dataloaders for slide-level (fixed-length feature vectors)
@@ -518,10 +519,7 @@ def _build_fastai_learner(
         logging.warning("Model does not support attention. Falling back to default loss function.")
         loss_func = nn.CrossEntropyLoss(weight=weight) if (problem_type == "classification" and weight is not None) else default_loss
     else:
-        if 'loss' in pb_config['experiment']:
-            loss_func = custom_forward if require_attention else loss_function
-        else:
-            loss_func = nn.CrossEntropyLoss(weight=weight) if (problem_type == "classification" and weight is not None) else default_loss
+        loss_func = custom_forward if require_attention else loss_function
 
     # === METRICS ===
     if 'custom_metrics' in pb_config['experiment']:
