@@ -388,27 +388,38 @@ def _build_fastai_learner(
 
         #Log one sample from the dataset
         logging.debug(f"Sample from slide-level train dataset: {train_dataset[0]}")
+
+        # NOTE: The data loader expects samples to be uniform in shape during collation (unless you override it),
+        # however in slide-level mode the feature vectors are batched per-slide, and slides may contain a different
+        # number of feature vectors. This causes fa_collate to throw an error
+        # --> We override the collate_fn to circumvent this problem.
+        def variable_length_collate(batch):
+            # batch is a list of tuples (x, y)
+            xs, ys = zip(*batch)
+            return list(xs), torch.stack(ys)
+
         # Dataloaders for slide-level (fixed-length feature vectors)
-        train_dl = DataLoader(
+        from torch.utils.data import DataLoader as TorchDataLoader
+
+        train_dl = TorchDataLoader(
             train_dataset,
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=dl_kwargs.get("num_workers", num_workers),
-            device=device,
             drop_last=True,
             persistent_workers=False,
-            multiprocessing_context=ctx,
-            **dl_kwargs
+            collate_fn=variable_length_collate,
+            **({"multiprocessing_context": ctx} if use_multiprocessing else {})
         )
-        val_dl = DataLoader(
+
+        val_dl = TorchDataLoader(
             val_dataset,
             batch_size=1,
             shuffle=False,
             num_workers=dl_kwargs.get("num_workers", num_workers),
             persistent_workers=False,
-            device=device,
-            multiprocessing_context=ctx,
-            **dl_kwargs
+            collate_fn=variable_length_collate,
+            **({"multiprocessing_context": ctx} if use_multiprocessing else {})
         )
         #Log one sample from the dataloader
         logging.debug(f"Sample from slide-level train dataloader: {next(iter(train_dl))}")
@@ -455,9 +466,10 @@ def _build_fastai_learner(
         )
 
     # === DETERMINE INPUT/OUTPUT DIMENSIONS ===
-    sample = next(iter(train_dl))
-    n_in = sample[0].shape[-1]
     if slide_level:
+        sample = next(iter(train_dl))
+        first_tensor = sample[0][0]
+        n_in = first_tensor.shape[-1]
         if problem_type == "classification":
             n_out = unique_categories.shape[0]
         elif problem_type in ["regression", "survival"]:
@@ -467,6 +479,8 @@ def _build_fastai_learner(
         else:
             n_out = 1
     else:
+        sample = next(iter(train_dl))
+        n_in = sample[0].shape[-1]
         n_out = sample[-1].shape[-1]
         if problem_type in ["survival", "regression"]:
             n_out = 1
