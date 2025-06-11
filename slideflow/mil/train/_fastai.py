@@ -29,10 +29,44 @@ from functools import partial
 from lifelines.utils import concordance_index
 
 #import custom losses and metrics
-from pathbench import losses, metrics, callbacks
+from pathbench import losses
+from pathbench import metrics as pathbench_metrics
 
 # -----------------------------------------------------------------------------
 
+
+class ReduceLROnPlateau(Callback):
+    "A simple ReduceLROnPlateau callback that adjusts LR when a monitored metric plateaus."
+    order = 60  # Ensure this runs after most other callbacks
+    def __init__(self, monitor='valid_loss', factor=0.1, patience=2, min_lr=1e-7, verbose=False):
+        self.monitor = monitor
+        self.factor = factor
+        self.patience = patience
+        self.min_lr = min_lr
+        self.verbose = verbose
+
+    def before_fit(self):
+        self.best = float('inf')
+        self.num_bad_epochs = 0
+
+    def after_epoch(self):
+        # Assume that valid_loss is the first metric in recorder.values.
+        # If you have a different ordering, adjust the index accordingly.
+        if not self.recorder.values: return
+        current = self.recorder.values[-1][0]
+        if current < self.best:
+            self.best = current
+            self.num_bad_epochs = 0
+        else:
+            self.num_bad_epochs += 1
+
+        if self.num_bad_epochs >= self.patience:
+            for i, pg in enumerate(self.opt.param_groups):
+                new_lr = max(pg['lr'] * self.factor, self.min_lr)
+                if self.verbose:
+                    print(f"Reducing lr for group {i} from {pg['lr']:.2e} to {new_lr:.2e}")
+                pg['lr'] = new_lr
+            self.num_bad_epochs = 0  # Reset the counter after a reduction
 
 
 
@@ -54,21 +88,6 @@ def retrieve_custom_loss(loss_name):
     loss_class = getattr(losses, loss_name)
     return loss_class()  # Instantiate the loss class
 
-
-def retrieve_custom_callback(callback_name):
-    """
-    This function retrieves the custom callback class based on the callback name.
-    Callback can be any callback class as defined in pathbench/utils/callbacks.py or any fastai callback.
-    """
-    logging.info(f"Retrieving custom callback: {callback_name}")
-    # Check if the callback is a fastai callback
-    if hasattr(Callback, callback_name):
-        callback_class = getattr(Callback, callback_name)
-    else:
-        # Otherwise, assume it's a custom callback defined in pathbench/utils/callbacks.py
-        callback_class = getattr(callbacks, callback_name)
-    return callback_class()  # Instantiate the callback class
-
 """
 This function retrieves the custom metric class based on the metric name.
 Metric can be any metric class as defined in pathbench/utils/metrics.py or fastai.metrics
@@ -78,7 +97,7 @@ def retrieve_custom_metric(metric_name):
     if hasattr(fastai_metrics, metric_name):
         metric_class = getattr(fastai_metrics, metric_name)
     else:
-        metric_class = getattr(metrics, metric_name)
+        metric_class = getattr(pathbench_metrics, metric_name)
     return metric_class()  # Instantiate the metric class
 
 
@@ -165,10 +184,11 @@ def train(learner, config, pb_config=None, callbacks=None):
         else:
             epochs = config.epochs
 
-        #Add schedulers if specified
-        if 'schedulers' in pb_config['experiment']:
-            for scheduler in pb_config['experiment']['schedulers']:
-                cbs.append(retrieve_custom_callback(scheduler))
+        #Add learning rate scheduler if specified
+        if 'scheduler' in pb_config['experiment']:
+            scheduler = pb_config['experiment']['scheduler']
+            if scheduler == 'ReduceLROnPlateau':
+                cbs.append(ReduceLROnPlateau())
 
         learner.fit(n_epoch=epochs, lr=lr, wd=wd, cbs=cbs)
         return learner
@@ -342,6 +362,7 @@ def _build_fastai_learner(
                 # Check if events are binary (0 or 1)
                 if not torch.all(torch.isin(events, torch.tensor([0, 1]))):
                     raise ValueError("Events must be binary (0 or 1) for survival analysis.")
+                    
                 if class_weighting:
                     num_events = torch.sum(events)
                     num_censored = targets.shape[0] - num_events
@@ -364,14 +385,12 @@ def _build_fastai_learner(
             targets[train_idx],
             survival_discrete=(problem_type == "survival_discrete"),
             encoder=encoder,
-            bag_size=1
         )
         val_dataset = data_utils.build_slide_dataset(
             [bags[i] for i in val_idx],
             targets[val_idx],
             survival_discrete=(problem_type == "survival_discrete"),
             encoder=encoder,
-            bag_size=1
         )
 
         ctx = mp.get_context("spawn")
@@ -427,6 +446,7 @@ def _build_fastai_learner(
             num_workers=num_workers,
             persistent_workers=False,
             drop_last=config.drop_last,
+            after_item=PadToMinLength(),
             device=device,
             multiprocessing_context=ctx,
             **dl_kwargs
@@ -521,10 +541,17 @@ def _build_fastai_learner(
             metrics = [RocAuc()]
         elif problem_type == "regression":
             metrics = [mae]
-        elif problem_type in ["survival", "survival_discrete"]:
-            metrics = [ConcordanceIndex()]
+        elif problem_type == "survival":
+            metrics = [ConcordanceIndex(invert_preds=True)]
+        elif problem_type == "survival_discrete":
+            metrics = [ConcordanceIndex(invert_preds=False)]
         else:
             metrics = []
+
+    #Snure that any ConcordanceIndex metrics are instantiated correctly
+    for m in metrics:
+        if isinstance(m, getattr(pathbench_metrics, 'ConcordanceIndex')):
+            m.invert_preds = (problem_type == "survival")
 
     logging.debug(f"Targets shape: {targets.shape}")
     if targets.ndim > 1 and targets.shape[1] == 1:

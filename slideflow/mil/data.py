@@ -86,7 +86,7 @@ def build_slide_dataset(
     encoder: Optional[SKLearnEncoder] = None,
     use_lens: bool = False,
     survival_discrete: bool = False,
-    bag_size: Optional[int] = None  # NEW parameter: fixed bag size to sample/pad
+    bag_size: Optional[int] = None  #fixed bag size to sample/pad
 ) -> Dataset:
     """
     Build a slide-level dataset for MIL tasks.
@@ -144,11 +144,6 @@ def build_slide_dataset(
             
             # Remove extra dimension if there's only one slide (i.e. shape is (1, feature_dim))
             if features.dim() == 2 and features.shape[0] == 1:
-                features = features.squeeze(0)
-
-            #IF there are multiple slides, we average them (Case where patient bagging is used)
-            if features.dim() > 2:
-                features = features.mean(dim=0, keepdim=True)
                 features = features.squeeze(0)
 
             target = self.targets[idx]
@@ -311,6 +306,11 @@ class BagDataset(Dataset):
         self.bag_size = bag_size
         self.preload = preload
 
+        logging.debug(
+            f"BagDataset initialized with {len(self.bags)} bags, "
+            f"bag_size={self.bag_size}, preload={preload}"
+        )
+
         if self.preload:
             self.bags = [self._load(i) for i in range(len(self.bags))]
 
@@ -339,7 +339,7 @@ class BagDataset(Dataset):
             feats = self._load(index)
 
         # sample a subset, if required
-        if self.bag_size:
+        if self.bag_size != None and self.bag_size != "None":
             return _to_fixed_size_bag(feats, bag_size=self.bag_size)
         else:
             return feats, len(feats)

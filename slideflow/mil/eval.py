@@ -219,8 +219,7 @@ def _eval_mil(
         log.debug("DataFrame after type conversion:")
         log.debug(df.head())
         
-        c_index = concordance_index(df['duration'], df['y_pred0'], df['y_true'])
-        log.info(f"Concordance Index: {c_index:.3f}")
+        c_index = concordance_index(df['duration'], -df['y_pred0'], df['y_true'])
         df['c_index'] = c_index
 
     elif task == 'survival_discrete':
@@ -241,8 +240,8 @@ def _eval_mil(
             log.info(f"AP  (time={all_time_labels[idx]}): {ap:.3f}")
 
         c_index = concordance_index(df['duration'], pred_scores, event_observed=df['y_true'])
-        log.info(f"Concordance Index: {c_index:.3f}")
         df['c_index'] = c_index
+        
     elif task == 'regression':
         # Calculate regression metrics
         mae = mean_absolute_error(df['y_true'], df['y_pred0'])

@@ -3935,6 +3935,8 @@ def create(
         except shutil.SameFileError:
             pass
 
+    #This code would add a default source to the project, but pathbench will force at least one specicfied source.
+    """
     # Set up the dataset source.
     if 'sources' not in proj_kwargs or proj_kwargs['sources'] is not None:
         P.add_source(
@@ -3968,6 +3970,8 @@ def create(
             log.info(f"Extrating ROIs from tarfile at {cfg.rois}.")
             roi_file = tarfile.open(cfg.rois)
             roi_file.extractall(cfg.roi_dest)
+
+    """
 
     # Download slides from GDC (TCGA), if specified.
     if download:
