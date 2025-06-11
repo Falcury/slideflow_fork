@@ -508,7 +508,7 @@ def _build_fastai_learner(
         if loss_function is None:
             loss_function = nn.CrossEntropyLoss(weight=weight)
     elif problem_type == "classification" and not class_weighting:
-        loss_function = nn.CrossEntropyLoss()
+        loss_function = nn.CrossEntropyLoss() if loss_function is None else loss_function
 
     # === ATTENTION & CUSTOM FORWARD HANDLING ===
     require_attention = getattr(loss_function, 'require_attention', False)
@@ -544,16 +544,11 @@ def _build_fastai_learner(
         elif problem_type == "regression":
             metrics = [mae]
         elif problem_type == "survival":
-            metrics = [ConcordanceIndex(invert_preds=True)]
+            metrics = [ConcordanceIndex()]
         elif problem_type == "survival_discrete":
-            metrics = [ConcordanceIndex(invert_preds=False)]
+            metrics = [ConcordanceIndex()]
         else:
             metrics = []
-
-    #Snure that any ConcordanceIndex metrics are instantiated correctly
-    for m in metrics:
-        if isinstance(m, getattr(pathbench_metrics, 'ConcordanceIndex')):
-            m.invert_preds = (problem_type == "survival")
 
     logging.debug(f"Targets shape: {targets.shape}")
     if targets.ndim > 1 and targets.shape[1] == 1:
