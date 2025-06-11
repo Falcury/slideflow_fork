@@ -409,6 +409,7 @@ def _build_fastai_learner(
             drop_last=True,
             persistent_workers=False,
             multiprocessing_context=ctx,
+            after_item=PadToMinLength(),  # Pad to minimum length
             **dl_kwargs
         )
         val_dl = DataLoader(
@@ -419,6 +420,7 @@ def _build_fastai_learner(
             persistent_workers=False,
             device=device,
             multiprocessing_context=ctx,
+            after_item=PadToMinLength(),  # Pad to minimum length
             **dl_kwargs
         )
         #Log one sample from the dataloader
@@ -529,9 +531,9 @@ def _build_fastai_learner(
 
     if require_attention and not model_supports_attention:
         logging.warning("Model does not support attention. Falling back to default loss function.")
-        loss_func = nn.CrossEntropyLoss(weight=weight) if (problem_type == "classification" and weight is not None) else default_loss
+        loss_function = nn.CrossEntropyLoss(weight=weight) if (problem_type == "classification" and weight is not None) else default_loss
     else:
-        loss_func = custom_forward if require_attention else loss_function
+        loss_function = custom_forward if require_attention else loss_function
 
     # === METRICS ===
     if 'custom_metrics' in pb_config['experiment']:
@@ -562,8 +564,8 @@ def _build_fastai_learner(
     optimizer = dl_kwargs.get("optimizer", None)
     if optimizer is not None:
         optimizer = retrieve_optimizer(optimizer)
-        learner = Learner(dls, model, loss_func=loss_func, metrics=metrics, path=outdir, opt_func=optimizer)
+        learner = Learner(dls, model, loss_func=loss_function, metrics=metrics, path=outdir, opt_func=optimizer)
     else:
-        learner = Learner(dls, model, loss_func=loss_func, metrics=metrics, path=outdir)
+        learner = Learner(dls, model, loss_func=loss_function, metrics=metrics, path=outdir)
 
     return learner, (n_in, n_out)
