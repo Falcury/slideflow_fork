@@ -85,8 +85,7 @@ Loss can be any loss class as defined in pathbench/utils/losses.py
 """
 def retrieve_custom_loss(loss_name):
     logging.info(f"Retrieving custom loss: {loss_name}")
-    loss_class = getattr(losses, loss_name)
-    return loss_class()  # Instantiate the loss class
+    return getattr(losses, loss_name)
 
 """
 This function retrieves the custom metric class based on the metric name.
@@ -291,9 +290,9 @@ def _build_fastai_learner(
     
     loss_function = dl_kwargs.get("loss", None)
     if loss_function is not None:
-        loss_function = retrieve_custom_loss(loss_function)
+        loss_cls = retrieve_custom_loss(loss_function)
     else:
-        loss_function = default_loss
+        loss_cls = default_loss
 
     if 'class_weighting' in pb_config['experiment']:
         class_weighting = pb_config['experiment']['class_weighting']
@@ -321,8 +320,7 @@ def _build_fastai_learner(
                 targets[:, 0] = targets[:, 0].astype(int)
                 # Use time bins to define the output dimension.
                 encoder = OneHotEncoder(sparse_output=False).fit(targets[:, 0].reshape(-1, 1))
-            else:
-                encoder = None
+
 
             logging.debug(f"Encoder categories: {encoder.categories_}")
             logging.debug(f"Events shape: {targets[:, 1].shape}, Events  dtype: {targets[:, 1].dtype}")
@@ -369,10 +367,12 @@ def _build_fastai_learner(
                     event_weight = num_censored / (num_events + num_censored)
                     censored_weight = num_events / (num_events + num_censored)
                     logging.debug(f"Event weight: {event_weight}, Censored weight: {censored_weight}")
-                    loss_function = partial(loss_function, event_weight=event_weight, censored_weight=censored_weight)
+                    loss_function = loss_cls(event_weight=event_weight, censored_weight=censored_weight)
                 else:
-                    loss_function = partial(loss_function, event_weight=1.0, censored_weight=1.0)
+                    loss_function = loss_cls(1.0, 1.0)  # Default weights
             targets = torch.tensor(targets, dtype=torch.float32)
+        else:
+            loss_function = loss_cls() if loss_cls is not None else default_loss
 
     # === DATASET & DATALOADER CREATION ===
     if slide_level:
