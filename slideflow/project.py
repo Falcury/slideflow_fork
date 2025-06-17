@@ -2054,6 +2054,7 @@ class Project:
             progress_type="slide_progress",
             total=len(dataset.slides()))
         pb.start()
+        
 
         # Prepare keyword arguments.
         dts_kwargs = dict(
@@ -2061,7 +2062,6 @@ class Project:
             include_uncertainty=False,
             batch_size=batch_size,
             verbose=False,
-            progress=False,
             **kwargs
         )
 
