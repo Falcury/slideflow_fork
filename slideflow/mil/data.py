@@ -20,6 +20,75 @@ class SKLearnEncoder(Protocol):
     def transform(self, x: List[List[Any]]):
         ...
 
+class SlideDataset(Dataset):
+    def __init__(
+        self,
+        bags: List[Union[Path, np.ndarray, torch.Tensor, List[Union[Path, np.ndarray, torch.Tensor, str]]]],
+        targets: Union[npt.NDArray, torch.Tensor, List[Any]],
+        encoder: Optional[SKLearnEncoder] = None,
+        use_lens: bool = False,
+        bag_size: Optional[int] = None
+    ):
+        assert len(bags) == len(targets)
+        self.bags      = bags
+        self.targets   = targets
+        self.encoder   = encoder
+        self.use_lens  = use_lens
+        self.bag_size  = bag_size
+
+    def __len__(self):
+        return len(self.bags)
+
+    def __getitem__(self, idx):
+        features = load_slide(self.bags[idx])
+        if torch.is_tensor(features):
+            features = features.detach().cpu()
+        else:
+            features = torch.tensor(features, dtype=torch.float32)
+
+        # squeeze singleton-slide bags
+        if features.dim()==2 and features.shape[0]==1:
+            features = features.squeeze(0)
+
+        target = self.targets[idx]
+        if self.encoder is None:
+            if not torch.is_tensor(target):
+                # first coerce to a float32 NumPy array (handles strings, lists, scalars)
+                arr = np.array(target, dtype=np.float32)
+                # then convert to a torch tensor
+                target = torch.from_numpy(arr)
+            else:
+                target = target.cpu().float()
+            # squeeze out any singleton first dimension, as before
+            if target.dim()==2 and target.shape[0]==1:
+                target = target.squeeze(0)
+        else:
+            # leave raw target for the encoder to handle
+            if torch.is_tensor(target):
+                target = target.detach().cpu()
+
+        return features, target
+
+
+class EncodedSlideDataset(Dataset):
+    """Wrap an existing SlideDataset and apply an sklearn encoder to its labels."""
+    def __init__(self, base_ds: SlideDataset, encoder: SKLearnEncoder):
+        self.base    = base_ds
+        self.encoder = encoder
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        features, target = self.base[idx]
+        # if it’s a scalar tensor or Python scalar, turn it into a 1×1 array
+        val = target.item() if torch.is_tensor(target) and target.numel()==1 else target
+        arr = np.array([val]).reshape(-1,1)
+        encoded = self.encoder.transform(arr)            # e.g. OneHotEncoder → shape (1, n_classes)
+        encoded = torch.tensor(encoded, dtype=torch.float32)
+        if encoded.dim()==2 and encoded.shape[0]==1:
+            encoded = encoded.squeeze(0)
+        return features, encoded
 
 # Module-level zip variants
 def _zip_build_dataset_no_lens(bag: Tuple[torch.Tensor,int], target: Any, use_lens: bool=False) -> Tuple:
@@ -122,76 +191,10 @@ def build_slide_dataset(
         targets = targets[:, 0]
         targets = targets.astype(int)
 
-    class SlideDataset(Dataset):
-        def __init__(self, bags, targets, encoder=None, use_lens: bool = False, bag_size: Optional[int] = None):
-            assert len(bags) == len(targets), "Mismatch between number of bags and targets."
-            self.bags = bags
-            self.targets = targets
-            self.encoder = encoder  # if provided, we preserve raw targets (e.g., strings)
-            self.use_lens = use_lens
-            self.bag_size = bag_size  # or a fixed value if needed
-
-        def __len__(self):
-            return len(self.bags)
-
-        def __getitem__(self, idx):
-            features = load_slide(self.bags[idx])
-            # Ensure features are detached and on CPU
-            if torch.is_tensor(features):
-                features = features.detach().cpu()
-            else:
-                features = torch.tensor(features, dtype=torch.float32)
-            
-            # Remove extra dimension if there's only one slide (i.e. shape is (1, feature_dim))
-            if features.dim() == 2 and features.shape[0] == 1:
-                features = features.squeeze(0)
-
-            target = self.targets[idx]
-            if self.encoder is None:
-                if not torch.is_tensor(target):
-                    target = torch.tensor(target, dtype=torch.float32)
-                else:
-                    target = target.cpu()
-                # Squeeze the target if it has an extra dimension (e.g., shape (1, n_classes))
-                if target.dim() == 2 and target.shape[0] == 1:
-                    target = target.squeeze(0)
-            else:
-                if torch.is_tensor(target):
-                    target = target.detach().cpu()
-            
-            return features, target
-
+    base = SlideDataset(bags, targets, encoder=None, use_lens=use_lens, bag_size=bag_size)
     if encoder is not None:
-        class EncodedSlideDataset(Dataset):
-            def __init__(self, base_dataset, encoder):
-                self.base = base_dataset
-                self.encoder = encoder
-
-            def __len__(self):
-                return len(self.base)
-
-            def __getitem__(self, idx):
-                features, target = self.base[idx]
-                # Convert target to a Python scalar for encoding (if it's a single value)
-                if torch.is_tensor(target):
-                    # If target is 0D or has a single element, convert it
-                    target_val = target.item() if target.numel() == 1 else target
-                else:
-                    target_val = target
-                arr = np.array([target_val])
-                arr_2d = arr.reshape(-1, 1)  # ensure a 2D array for the encoder
-                # Apply the encoder (e.g., LabelEncoder or OneHotEncoder)
-                encoded = self.encoder.transform(arr_2d)
-                encoded = torch.tensor(encoded, dtype=torch.float32)
-                # Remove extra dimension if needed
-                if encoded.dim() == 2 and encoded.shape[0] == 1:
-                    encoded = encoded.squeeze(0)
-                return features.cpu(), encoded.detach().cpu()
-
-        base_ds = SlideDataset(bags, targets, encoder=encoder, use_lens=use_lens, bag_size=bag_size)
-        return EncodedSlideDataset(base_ds, encoder)
-    else:
-        return SlideDataset(bags, targets, encoder=encoder, use_lens=use_lens, bag_size=bag_size)
+        return EncodedSlideDataset(base, encoder)
+    return base
 
 def build_dataset(
     bags,

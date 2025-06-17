@@ -258,6 +258,12 @@ def _build_fastai_learner(
     pb_config = dl_kwargs.get("pb_config", None)
     if pb_config is not None:
         num_workers = pb_config['experiment']['num_workers']
+        mp_ctx = mp.get_context(pb_config['experiment'].get('multiprocessing_context', 'spawn'))
+        pers_workers = pb_config['experiment'].get('persistent_workers', False)
+    else:
+        num_workers = dl_kwargs.get("num_workers", 0)
+        mp_ctx = mp.get_context(dl_kwargs.get("multiprocessing_context", 'spawn'))
+        pers_workers = dl_kwargs.get("persistent_workers", False)
 
     config_dict = config.to_dict() # Convert to dictionary
     logging.info(f"Building FastAI learner with config: {config}")
@@ -395,7 +401,6 @@ def _build_fastai_learner(
         )
 
         use_multiprocessing = dl_kwargs.get("num_workers", num_workers) > 0
-        ctx = mp.get_context("spawn") if use_multiprocessing else None
 
         #Log one sample from the dataset
         logging.debug(f"Sample from slide-level train dataset: {train_dataset[0]}")
@@ -407,8 +412,8 @@ def _build_fastai_learner(
             num_workers=dl_kwargs.get("num_workers", num_workers),
             device=device,
             drop_last=True,
-            persistent_workers=False,
-            multiprocessing_context=ctx,
+            persistent_workers=pers_workers,
+            multiprocessing_context=mp_ctx,
             after_item=PadToMinLength(),  # Pad to minimum length
             **dl_kwargs
         )
@@ -417,9 +422,9 @@ def _build_fastai_learner(
             batch_size=1,
             shuffle=False,
             num_workers=dl_kwargs.get("num_workers", num_workers),
-            persistent_workers=False,
+            persistent_workers=pers_workers,
             device=device,
-            multiprocessing_context=ctx,
+            multiprocessing_context=mp_ctx,
             after_item=PadToMinLength(),  # Pad to minimum length
             **dl_kwargs
         )
@@ -443,17 +448,17 @@ def _build_fastai_learner(
             use_lens=config.model_config.use_lens,
             survival_discrete=(problem_type == "survival_discrete")
         )
-        ctx = mp.get_context("spawn")
+        logging.debug(f"config batch size: {config.batch_size}")
         train_dl = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=num_workers,
-            persistent_workers=False,
+            persistent_workers= pers_workers,
             drop_last=config.drop_last,
-            after_item=PadToMinLength(),
+            after_item=PadToMinLength(),  # if config.batch_size == None or config.batch_size == 'None' else None,
             device=device,
-            multiprocessing_context=ctx,
+            multiprocessing_context=mp_ctx,
             **dl_kwargs
         )
         val_dl = DataLoader(
@@ -461,10 +466,10 @@ def _build_fastai_learner(
             batch_size=1 if problem_type == "classification" else config.batch_size,
             shuffle=False,
             num_workers=num_workers,
-            persistent_workers=False,
+            persistent_workers= pers_workers,
             device=device,
             after_item=PadToMinLength(),
-            multiprocessing_context=ctx,
+            multiprocessing_context=mp_ctx,
             **dl_kwargs
         )
 
@@ -544,11 +549,15 @@ def _build_fastai_learner(
         elif problem_type == "regression":
             metrics = [mae]
         elif problem_type == "survival":
-            metrics = [ConcordanceIndex()]
+            metrics = [ConcordanceIndex(invert_preds=True)]
         elif problem_type == "survival_discrete":
-            metrics = [ConcordanceIndex()]
+            metrics = [ConcordanceIndex(invert_preds=False)]
         else:
             metrics = []
+
+    for m in metrics:
+        if isinstance(m, getattr(pathbench_metrics, 'ConcordanceIndex')):
+            m.invert_preds = (problem_type == "survival")
 
     logging.debug(f"Targets shape: {targets.shape}")
     if targets.ndim > 1 and targets.shape[1] == 1:

@@ -219,7 +219,7 @@ def _eval_mil(
         log.debug("DataFrame after type conversion:")
         log.debug(df.head())
         
-        c_index = concordance_index(df['duration'], df['y_pred0'], df['y_true'])
+        c_index = concordance_index(df['duration'], -df['y_pred0'], df['y_true'])
         df['c_index'] = c_index
 
     elif task == 'survival_discrete':
