@@ -46,10 +46,6 @@ class SlideDataset(Dataset):
         else:
             features = torch.tensor(features, dtype=torch.float32)
 
-        # squeeze singleton-slide bags
-        if features.dim()==2 and features.shape[0]==1:
-            features = features.squeeze(0)
-
         target = self.targets[idx]
         if self.encoder is None:
             if not torch.is_tensor(target):
@@ -191,7 +187,7 @@ def build_slide_dataset(
         targets = targets[:, 0]
         targets = targets.astype(int)
 
-    base = SlideDataset(bags, targets, encoder=None, use_lens=use_lens, bag_size=bag_size)
+    base = SlideDataset(bags, targets, encoder=encoder, use_lens=use_lens, bag_size=bag_size)
     if encoder is not None:
         return EncodedSlideDataset(base, encoder)
     return base

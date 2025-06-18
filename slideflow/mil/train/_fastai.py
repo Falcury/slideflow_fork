@@ -127,6 +127,15 @@ class PadToMinLength:
 
         return padded_batch
 
+import torch.nn.functional as F
+class PadToMaxLength:
+    """FastAI transform: pad each batch's bags to the batch‐max length."""
+    def __call__(self, batch):
+        feats, targets = zip(*batch)
+        max_len = max(f.shape[0] for f in feats)
+        padded = [F.pad(f, (0,0, 0, max_len - f.shape[0])) for f in feats]
+        return (torch.stack(padded), torch.stack([t.squeeze() for t in targets]))
+
 
 def train(learner, config, pb_config=None, callbacks=None):
     """Train an attention-based multi-instance learning model with FastAI.
@@ -414,7 +423,7 @@ def _build_fastai_learner(
             drop_last=True,
             persistent_workers=pers_workers,
             multiprocessing_context=mp_ctx,
-            after_item=PadToMinLength(),  # Pad to minimum length
+            before_batch=PadToMaxLength(),
             **dl_kwargs
         )
         val_dl = DataLoader(
@@ -425,7 +434,7 @@ def _build_fastai_learner(
             persistent_workers=pers_workers,
             device=device,
             multiprocessing_context=mp_ctx,
-            after_item=PadToMinLength(),  # Pad to minimum length
+            before_batch=PadToMaxLength(),
             **dl_kwargs
         )
         #Log one sample from the dataloader
