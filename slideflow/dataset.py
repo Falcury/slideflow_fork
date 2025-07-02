@@ -3355,11 +3355,23 @@ class Dataset:
                 "This may happen if multiple tfrecords were found for a slide."
             )
         if not len(training_tfr) == len(train_slides):
-            raise errors.DatasetError(
-                f"Number of training tfrecords ({len(training_tfr)}) does "
-                f"not match number of training slides ({len(train_slides)}). "
-                "This may happen if multiple tfrecords were found for a slide."
-            )
+
+            # Remove the  training tfrecords that are not in the training slides and vice versa
+            training_tfr = [
+                tfr for tfr in tfr_dir_list
+                if path_to_name(tfr) in train_slides or tfr in train_slides
+            ]
+            
+            train_slides = [
+                s for s in train_slides
+                if path_to_name(s) in tfr_dir_list_names or s in tfr_dir_list_names
+            ]
+            if not len(training_tfr) == len(train_slides):
+                raise errors.DatasetError(
+                    f"Number of training tfrecords ({len(training_tfr)}) does "
+                    f"not match number of training slides ({len(train_slides)}). "
+                    "This may happen if multiple tfrecords were found for a slide."
+                )
         training_dts = copy.deepcopy(self)
         training_dts = training_dts.filter(filters={'slide': train_slides})
         val_dts = copy.deepcopy(self)

@@ -20,7 +20,6 @@ from .._params import (
 if TYPE_CHECKING:
     from fastai.learner import Learner
 
-
 # -----------------------------------------------------------------------------
 
 def train_mil(

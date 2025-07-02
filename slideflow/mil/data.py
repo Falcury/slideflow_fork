@@ -269,6 +269,7 @@ def _to_fixed_size_bag(
             torch.zeros(bag_size - bag_samples.shape[0], bag_samples.shape[1]),
         )
     )
+    #logging.info(f"Transformed bag to fixed size: {zero_padded.shape}")
     return zero_padded, min(bag_size, len(bag))
 
 # -----------------------------------------------------------------------------

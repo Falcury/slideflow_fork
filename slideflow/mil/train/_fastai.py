@@ -14,6 +14,7 @@ import multiprocessing as mp
 from fastai.vision.all import (
     DataLoader, DataLoaders, Learner, RocAuc, SaveModelCallback, CSVLogger, FetchPredsCallback, Callback
 )
+from torch.utils.data import DataLoader as TorchDataLoader
 from fastai.callback.schedule import ParamScheduler
 from fastai.learner import Metric
 from fastai.torch_core import to_detach, flatten_check
@@ -29,46 +30,9 @@ from functools import partial
 from lifelines.utils import concordance_index
 
 #import custom losses and metrics
-from pathbench import losses
-from pathbench import metrics as pathbench_metrics
+from pathbench import losses, metrics, callbacks
 
 # -----------------------------------------------------------------------------
-
-
-class ReduceLROnPlateau(Callback):
-    "A simple ReduceLROnPlateau callback that adjusts LR when a monitored metric plateaus."
-    order = 60  # Ensure this runs after most other callbacks
-    def __init__(self, monitor='valid_loss', factor=0.1, patience=2, min_lr=1e-7, verbose=False):
-        self.monitor = monitor
-        self.factor = factor
-        self.patience = patience
-        self.min_lr = min_lr
-        self.verbose = verbose
-
-    def before_fit(self):
-        self.best = float('inf')
-        self.num_bad_epochs = 0
-
-    def after_epoch(self):
-        # Assume that valid_loss is the first metric in recorder.values.
-        # If you have a different ordering, adjust the index accordingly.
-        if not self.recorder.values: return
-        current = self.recorder.values[-1][0]
-        if current < self.best:
-            self.best = current
-            self.num_bad_epochs = 0
-        else:
-            self.num_bad_epochs += 1
-
-        if self.num_bad_epochs >= self.patience:
-            for i, pg in enumerate(self.opt.param_groups):
-                new_lr = max(pg['lr'] * self.factor, self.min_lr)
-                if self.verbose:
-                    print(f"Reducing lr for group {i} from {pg['lr']:.2e} to {new_lr:.2e}")
-                pg['lr'] = new_lr
-            self.num_bad_epochs = 0  # Reset the counter after a reduction
-
-
 
 """
 This function retrieves the optimizer class based on the optimizer name.
@@ -85,7 +49,23 @@ Loss can be any loss class as defined in pathbench/utils/losses.py
 """
 def retrieve_custom_loss(loss_name):
     logging.info(f"Retrieving custom loss: {loss_name}")
-    return getattr(losses, loss_name)
+    loss_class = getattr(losses, loss_name)
+    return loss_class()  # Instantiate the loss class
+
+
+def retrieve_custom_callback(callback_name):
+    """
+    This function retrieves the custom callback class based on the callback name.
+    Callback can be any callback class as defined in pathbench/utils/callbacks.py or any fastai callback.
+    """
+    logging.info(f"Retrieving custom callback: {callback_name}")
+    # Check if the callback is a fastai callback
+    if hasattr(Callback, callback_name):
+        callback_class = getattr(Callback, callback_name)
+    else:
+        # Otherwise, assume it's a custom callback defined in pathbench/utils/callbacks.py
+        callback_class = getattr(callbacks, callback_name)
+    return callback_class()  # Instantiate the callback class
 
 """
 This function retrieves the custom metric class based on the metric name.
@@ -96,46 +76,72 @@ def retrieve_custom_metric(metric_name):
     if hasattr(fastai_metrics, metric_name):
         metric_class = getattr(fastai_metrics, metric_name)
     else:
-        metric_class = getattr(pathbench_metrics, metric_name)
+        metric_class = getattr(metrics, metric_name)
     return metric_class()  # Instantiate the metric class
 
 
 
 
 class PadToMinLength:
-    """Pad all tensors in a batch to the minimum length of the longest tensor."""
-    def __call__(self, batch):
-        # Filter out non-tensor elements
-        batch_tensors = [item for item in batch if isinstance(item, torch.Tensor)]
+    """Pad or truncate each bag tensor in a batch to the minimum bag‐length in that batch."""
+    def __call__(self, sample):
+        # Find only the multi-dim tensors (your bags)
+        tensor_items = [t for t in sample if isinstance(t, torch.Tensor) and t.dim()>0]
+        if not tensor_items:
+            return sample   # nothing to pad
 
-        # Find the minimum length among the tensors that have dimensions
-        min_length = min([item.size(0) if item.dim() > 0 else 1 for item in batch_tensors])
+        # Compute the shortest length along dim=0
+        min_len = min(t.size(0) for t in tensor_items)
 
-        # Pad each tensor to the minimum length
-        padded_batch = []
-        for item in batch:
-            if isinstance(item, torch.Tensor):
-                if item.dim() == 0:
-                    # If tensor has no dimensions, convert it to a 1-dimensional tensor
-                    item = item.unsqueeze(0)
-                if item.size(0) > min_length:
-                    item = item[:min_length]
-                elif item.size(0) < min_length:
-                    padding = (0, 0, 0, min_length - item.size(0))  # Adjust this if your tensor has more dimensions
-                    item = torch.nn.functional.pad(item, padding)
-            padded_batch.append(item)
+        new_sample = []
+        for item in sample:
+            # Only pad/truncate multi-dim tensors
+            if isinstance(item, torch.Tensor) and item.dim()>0:
+                L = item.size(0)
+                if L > min_len:
+                    item = item[:min_len]            # truncate
+                elif L < min_len:
+                    pad_amt = min_len - L
+                    # For a [D, C, F] tensor, pad = (F_l, F_r, C_l, C_r, D_l, D_r)
+                    item = F.pad(item, (0,0, 0,0, 0,pad_amt))
+            new_sample.append(item)
 
-        return padded_batch
+        return new_sample
 
+from torch.utils.data._utils.collate import default_collate
 import torch.nn.functional as F
-class PadToMaxLength:
-    """FastAI transform: pad each batch's bags to the batch‐max length."""
-    def __call__(self, batch):
-        feats, targets = zip(*batch)
-        max_len = max(f.shape[0] for f in feats)
-        padded = [F.pad(f, (0,0, 0, max_len - f.shape[0])) for f in feats]
-        return (torch.stack(padded), torch.stack([t.squeeze() for t in targets]))
 
+def slide_collate(samples):
+    # samples is List[ (Tensor, label) ]
+    xs, ys = zip(*samples)
+
+    # 1) normalize each x → always 2-D (n_slides, feat_dim)
+    proc_xs = []
+    for x in xs:
+        # if extra dims (e.g. [B, N, C, F]) flatten everything except last dim
+        if x.dim() > 2:
+            x = x.flatten(0, -2)
+        # if it's 1-D (i.e. [F]), treat as single slide → [1, F]
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        proc_xs.append(x)
+
+    # 2) pad/truncate on the slide axis (dim=0) so all have same n_slides
+    max_slides = max(x.shape[0] for x in proc_xs)
+    padded = []
+    for x in proc_xs:
+        n, f = x.shape
+        if n < max_slides:
+            # pad only at end of slide axis
+            x = F.pad(x, (0,0, 0, max_slides - n))
+        else:
+            x = x[:max_slides]
+        padded.append(x)
+
+    # 3) stack into [batch_size, n_slides, feat_dim]
+    batch_x = torch.stack(padded, dim=0)
+    batch_y = default_collate(ys)
+    return batch_x, batch_y
 
 def train(learner, config, pb_config=None, callbacks=None):
     """Train an attention-based multi-instance learning model with FastAI.
@@ -192,11 +198,10 @@ def train(learner, config, pb_config=None, callbacks=None):
         else:
             epochs = config.epochs
 
-        #Add learning rate scheduler if specified
-        if 'scheduler' in pb_config['experiment']:
-            scheduler = pb_config['experiment']['scheduler']
-            if scheduler == 'ReduceLROnPlateau':
-                cbs.append(ReduceLROnPlateau())
+        #Add schedulers if specified
+        if 'schedulers' in pb_config['experiment']:
+            for scheduler in pb_config['experiment']['schedulers']:
+                cbs.append(retrieve_custom_callback(scheduler))
 
         learner.fit(n_epoch=epochs, lr=lr, wd=wd, cbs=cbs)
         return learner
@@ -267,12 +272,6 @@ def _build_fastai_learner(
     pb_config = dl_kwargs.get("pb_config", None)
     if pb_config is not None:
         num_workers = pb_config['experiment']['num_workers']
-        mp_ctx = mp.get_context(pb_config['experiment'].get('multiprocessing_context', 'spawn'))
-        pers_workers = pb_config['experiment'].get('persistent_workers', False)
-    else:
-        num_workers = dl_kwargs.get("num_workers", 0)
-        mp_ctx = mp.get_context(dl_kwargs.get("multiprocessing_context", 'spawn'))
-        pers_workers = dl_kwargs.get("persistent_workers", False)
 
     config_dict = config.to_dict() # Convert to dictionary
     logging.info(f"Building FastAI learner with config: {config}")
@@ -284,6 +283,8 @@ def _build_fastai_learner(
     activation_function = config_dict['activation_function']
     problem_type = goal = config_dict['task']
     slide_level = config_dict['slide_level']
+    ctx = pb_config['experiment'].get('multiprocessing_context', 'spawn')
+    persistent_workers = pb_config['experiment'].get('persistent_workers', False)   
 
     #Determine whether slide-level or bag-level training is required
     if slide_level:
@@ -305,9 +306,9 @@ def _build_fastai_learner(
     
     loss_function = dl_kwargs.get("loss", None)
     if loss_function is not None:
-        loss_cls = retrieve_custom_loss(loss_function)
+        loss_function = retrieve_custom_loss(loss_function)
     else:
-        loss_cls = default_loss
+        loss_function = default_loss
 
     if 'class_weighting' in pb_config['experiment']:
         class_weighting = pb_config['experiment']['class_weighting']
@@ -329,13 +330,14 @@ def _build_fastai_learner(
             #Make sure durations are float valued in the case of survival
             if problem_type == "survival":
                 targets[:, 0] = targets[:, 0].astype(float)
-                encoder = None
-            else: # problem_type == "survival_discrete"
+                
+            elif problem_type == "survival_discrete":
                 #Convert time bins to int
                 targets[:, 0] = targets[:, 0].astype(int)
                 # Use time bins to define the output dimension.
                 encoder = OneHotEncoder(sparse_output=False).fit(targets[:, 0].reshape(-1, 1))
-
+            else:
+                encoder = None
 
             logging.debug(f"Encoder categories: {encoder.categories_}")
             logging.debug(f"Events shape: {targets[:, 1].shape}, Events  dtype: {targets[:, 1].dtype}")
@@ -375,67 +377,58 @@ def _build_fastai_learner(
                 # Check if events are binary (0 or 1)
                 if not torch.all(torch.isin(events, torch.tensor([0, 1]))):
                     raise ValueError("Events must be binary (0 or 1) for survival analysis.")
-                    
                 if class_weighting:
                     num_events = torch.sum(events)
                     num_censored = targets.shape[0] - num_events
                     event_weight = num_censored / (num_events + num_censored)
                     censored_weight = num_events / (num_events + num_censored)
                     logging.debug(f"Event weight: {event_weight}, Censored weight: {censored_weight}")
-                    loss_function = loss_cls(event_weight=event_weight, censored_weight=censored_weight)
+                    loss_function = partial(loss_function, event_weight=event_weight, censored_weight=censored_weight)
                 else:
-                    loss_function = loss_cls(1.0, 1.0)  # Default weights
+                    loss_function = partial(loss_function, event_weight=1.0, censored_weight=1.0)
             targets = torch.tensor(targets, dtype=torch.float32)
-        else:
-            loss_function = loss_cls() if loss_cls is not None else default_loss
 
     # === DATASET & DATALOADER CREATION ===
     if slide_level:
         logging.info("Building slide-level datasets....")
         #Log encoder and targets
-        if encoder is not None:
-            logging.debug(f"Encoder categories: {encoder.categories_}")
+        logging.debug(f"Encoder categories: {encoder.categories_}")
         logging.debug(f"Targets shape: {targets.shape}")
         train_dataset = data_utils.build_slide_dataset(
             [bags[i] for i in train_idx],
             targets[train_idx],
             survival_discrete=(problem_type == "survival_discrete"),
             encoder=encoder,
+            bag_size=None
         )
         val_dataset = data_utils.build_slide_dataset(
             [bags[i] for i in val_idx],
             targets[val_idx],
             survival_discrete=(problem_type == "survival_discrete"),
             encoder=encoder,
+            bag_size=None
         )
-
-        use_multiprocessing = dl_kwargs.get("num_workers", num_workers) > 0
 
         #Log one sample from the dataset
         logging.debug(f"Sample from slide-level train dataset: {train_dataset[0]}")
         # Dataloaders for slide-level (fixed-length feature vectors)
-        train_dl = DataLoader(
+        train_dl = TorchDataLoader(
             train_dataset,
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=dl_kwargs.get("num_workers", num_workers),
-            device=device,
             drop_last=True,
-            persistent_workers=pers_workers,
-            multiprocessing_context=mp_ctx,
-            before_batch=PadToMaxLength(),
-            **dl_kwargs
+            persistent_workers=persistent_workers,
+            multiprocessing_context=ctx,
+            collate_fn=slide_collate,  # Custom collate function to pad bags
         )
-        val_dl = DataLoader(
+        val_dl = TorchDataLoader(
             val_dataset,
             batch_size=1,
             shuffle=False,
             num_workers=dl_kwargs.get("num_workers", num_workers),
-            persistent_workers=pers_workers,
-            device=device,
-            multiprocessing_context=mp_ctx,
-            before_batch=PadToMaxLength(),
-            **dl_kwargs
+            multiprocessing_context=ctx,
+            collate_fn=slide_collate,  # Custom collate function to pad bags
         )
         #Log one sample from the dataloader
         logging.debug(f"Sample from slide-level train dataloader: {next(iter(train_dl))}")
@@ -457,17 +450,15 @@ def _build_fastai_learner(
             use_lens=config.model_config.use_lens,
             survival_discrete=(problem_type == "survival_discrete")
         )
-        logging.debug(f"config batch size: {config.batch_size}")
         train_dl = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=num_workers,
-            persistent_workers= pers_workers,
+            persistent_workers= persistent_workers,
             drop_last=config.drop_last,
-            after_item=PadToMinLength(),  # if config.batch_size == None or config.batch_size == 'None' else None,
             device=device,
-            multiprocessing_context=mp_ctx,
+            multiprocessing_context=ctx,
             **dl_kwargs
         )
         val_dl = DataLoader(
@@ -475,10 +466,10 @@ def _build_fastai_learner(
             batch_size=1 if problem_type == "classification" else config.batch_size,
             shuffle=False,
             num_workers=num_workers,
-            persistent_workers= pers_workers,
+            persistent_workers=persistent_workers,
             device=device,
             after_item=PadToMinLength(),
-            multiprocessing_context=mp_ctx,
+            multiprocessing_context=ctx,
             **dl_kwargs
         )
 
@@ -522,7 +513,7 @@ def _build_fastai_learner(
         if loss_function is None:
             loss_function = nn.CrossEntropyLoss(weight=weight)
     elif problem_type == "classification" and not class_weighting:
-        loss_function = nn.CrossEntropyLoss() if loss_function is None else loss_function
+        loss_function = nn.CrossEntropyLoss()
 
     # === ATTENTION & CUSTOM FORWARD HANDLING ===
     require_attention = getattr(loss_function, 'require_attention', False)
@@ -545,9 +536,12 @@ def _build_fastai_learner(
 
     if require_attention and not model_supports_attention:
         logging.warning("Model does not support attention. Falling back to default loss function.")
-        loss_function = nn.CrossEntropyLoss(weight=weight) if (problem_type == "classification" and weight is not None) else default_loss
+        loss_func = nn.CrossEntropyLoss(weight=weight) if (problem_type == "classification" and weight is not None) else default_loss
     else:
-        loss_function = custom_forward if require_attention else loss_function
+        if 'loss' in pb_config['experiment']:
+            loss_func = custom_forward if require_attention else loss_function
+        else:
+            loss_func = nn.CrossEntropyLoss(weight=weight) if (problem_type == "classification" and weight is not None) else default_loss
 
     # === METRICS ===
     if 'custom_metrics' in pb_config['experiment']:
@@ -557,16 +551,10 @@ def _build_fastai_learner(
             metrics = [RocAuc()]
         elif problem_type == "regression":
             metrics = [mae]
-        elif problem_type == "survival":
-            metrics = [ConcordanceIndex(invert_preds=True)]
-        elif problem_type == "survival_discrete":
-            metrics = [ConcordanceIndex(invert_preds=False)]
+        elif problem_type in ["survival", "survival_discrete"]:
+            metrics = [ConcordanceIndex()]
         else:
             metrics = []
-
-    for m in metrics:
-        if isinstance(m, getattr(pathbench_metrics, 'ConcordanceIndex')):
-            m.invert_preds = (problem_type == "survival")
 
     logging.debug(f"Targets shape: {targets.shape}")
     if targets.ndim > 1 and targets.shape[1] == 1:
@@ -577,8 +565,8 @@ def _build_fastai_learner(
     optimizer = dl_kwargs.get("optimizer", None)
     if optimizer is not None:
         optimizer = retrieve_optimizer(optimizer)
-        learner = Learner(dls, model, loss_func=loss_function, metrics=metrics, path=outdir, opt_func=optimizer)
+        learner = Learner(dls, model, loss_func=loss_func, metrics=metrics, path=outdir, opt_func=optimizer)
     else:
-        learner = Learner(dls, model, loss_func=loss_function, metrics=metrics, path=outdir)
+        learner = Learner(dls, model, loss_func=loss_func, metrics=metrics, path=outdir)
 
     return learner, (n_in, n_out)

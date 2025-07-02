@@ -87,10 +87,11 @@ def update_manifest_at_dir(
         rel_tfr_manifest = {rel_tfr: {}}
         try:
             total = get_tfrecord_length(tfr)
-        except (errors.TFRecordsError, OSError):
-            log.error(f"Corrupt or incomplete TFRecord at {tfr}; removing")
-            os.remove(tfr)
+        except (errors.TFRecordsError, OSError) as e:
+            log.warning(
+                f"Failed to read TFRecord {sf.util.green(tfr)}: {e}. ")
             return None
+                
         """ # Unnecessary check, and often false positive
         if not total:
             log.error(f"Empty TFRecord at {tfr}; removing")
@@ -153,6 +154,15 @@ def update_manifest_at_dir(
     if (manifest != prior_manifest) or (manifest == {}):
         sf.util.write_json(manifest, manifest_path)
 
+    #remove any duplicate entries
+    if len(manifest) > len(set(manifest.keys())):
+        log.warning(
+            f"Manifest at {sf.util.green(manifest_path)} has duplicate entries; "
+            "removing duplicates."
+        )
+        manifest = {k: v for k, v in manifest.items() if k not in prior_manifest}
+        sf.util.write_json(manifest, manifest_path)
+        
     log.debug(
         f"Updated manifest at {sf.util.green(manifest_path)} "
         f"with {len(manifest)} TFRecords"
